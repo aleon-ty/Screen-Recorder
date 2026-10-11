@@ -20,7 +20,7 @@ import android.Manifest
 import com.haseeb.recorder.R
 import com.haseeb.recorder.data.ConfigManager
 import com.haseeb.recorder.recording.ScreenRecordService
-import com.haseeb.recorder.shizuku.ShizukuManager
+import com.haseeb.recorder.privileged.PrivilegedAccessManager
 import com.haseeb.recorder.util.LocaleHelper
 
 /*
@@ -82,8 +82,16 @@ class MediaProjectionPermissionActivity : Activity() {
         if (isProjectionRequestPending) return
         if (!checkRuntimePermissions()) return
         if (!checkOverlayPermission()) return
-        if (ShizukuManager.isPermissionGranted() && configManager.isShizukuDirectRecordingEnabled) {
-            ShizukuManager.grantProjectMediaPermission(this)
+        if (PrivilegedAccessManager.isPermissionGranted() && configManager.isShizukuDirectRecordingEnabled) {
+            isProjectionRequestPending = true
+            PrivilegedAccessManager.runAsync {
+                PrivilegedAccessManager.grantProjectMediaPermission(applicationContext)
+                runOnUiThread {
+                    isProjectionRequestPending = false
+                    if (!isFinishing && !isDestroyed) requestMediaProjection()
+                }
+            }
+            return
         }
         requestMediaProjection()
     }

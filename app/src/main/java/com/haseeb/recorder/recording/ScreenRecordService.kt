@@ -27,7 +27,7 @@ import com.haseeb.recorder.camera.CameraOverlayService
 import com.haseeb.recorder.data.ConfigManager
 import com.haseeb.recorder.draw.DrawOverlayService
 import com.haseeb.recorder.overlay.RecordingOverlayService
-import com.haseeb.recorder.shizuku.ShizukuManager
+import com.haseeb.recorder.privileged.PrivilegedAccessManager
 import com.haseeb.recorder.ui.activity.MainActivity
 import java.io.File
 import java.text.SimpleDateFormat
@@ -62,6 +62,8 @@ class ScreenRecordService : Service() {
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_DATA = "data"
 
+        @Volatile var isStarting = false
+            private set
         @Volatile var isRecording = false
             private set
         @Volatile var isPaused = false
@@ -76,6 +78,9 @@ class ScreenRecordService : Service() {
         @Volatile private var lastAudioWrittenPtsUs = 0L
     }
 
+    @Volatile private var serviceDestroyed = false
+    private var startupPending = false
+    private var sessionUsesRoot = false
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -230,6 +235,11 @@ class ScreenRecordService : Service() {
      * Triggers the foreground notification and initializes data before recording starts.
      */
     private fun startRecordingSession(resultCode: Int, data: Intent) {
+        if (isRecording || isStarting) return
+        isStarting = true
+        startupPending = true
+        sessionUsesRoot = PrivilegedAccessManager.usesRoot
+        RecordingStateManager.notifyListeners()
         val wantsAudio = (configManager.isMicEnabled || configManager.isSystemAudioEnabled)
         val hasAudioPerm = checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         val canRecordAudio = wantsAudio && hasAudioPerm
@@ -252,8 +262,23 @@ class ScreenRecordService : Service() {
         lastVideoWrittenPtsUs = 0
         lastAudioWrittenPtsUs = 0
         
-        applyShizukuFeaturesOnStart()
-        startRecording(resultCode, data)
+        if (!PrivilegedAccessManager.isPermissionGranted()) {
+            isStarting = false
+            startupPending = false
+            startRecording(resultCode, data)
+            return
+        }
+        PrivilegedAccessManager.runAsync(sessionUsesRoot) {
+            if (!serviceDestroyed) applyPrivilegedFeaturesOnStart()
+            mainHandler.post {
+                startupPending = false
+                if (!serviceDestroyed) {
+                    isStarting = false
+                    startRecording(resultCode, data)
+                }
+                RecordingStateManager.notifyListeners()
+            }
+        }
     }
 
     /*
@@ -406,7 +431,7 @@ class ScreenRecordService : Service() {
 
         } catch (e: Exception) {
             Log.e(TAG, "Start failed: ${e.message}")
-            restoreShizukuFeaturesOnStop()
+            PrivilegedAccessManager.runAsync(sessionUsesRoot) { restorePrivilegedFeaturesOnStop() }
             cleanup()
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -441,38 +466,38 @@ class ScreenRecordService : Service() {
     }
 
     /*
-     * Applies privileged Shizuku settings at the beginning of recording session.
+     * Applies advanced settings through the selected backend before capture starts.
      */
-    private fun applyShizukuFeaturesOnStart() {
-        if (ShizukuManager.isPermissionGranted()) {
+    private fun applyPrivilegedFeaturesOnStart() {
+        if (PrivilegedAccessManager.isPermissionGranted()) {
             if (configManager.isShizukuShowTouchesEnabled) {
-                val success = ShizukuManager.setShowTouches(true)
+                val success = PrivilegedAccessManager.setShowTouches(true)
                 if (success) hasChangedShowTouches = true
             }
             if (configManager.isShizukuHideSystemBarsEnabled) {
-                val success = ShizukuManager.setImmersiveMode(true)
+                val success = PrivilegedAccessManager.setImmersiveMode(true)
                 if (success) hasChangedImmersive = true
             }
             if (configManager.isShizukuEnhancedAudioEnabled) {
-                ShizukuManager.grantEnhancedAudioPermission(this)
+                PrivilegedAccessManager.grantEnhancedAudioPermission(this)
             }
             if (configManager.isShizukuDirectRecordingEnabled) {
-                ShizukuManager.grantProjectMediaPermission(this)
+                PrivilegedAccessManager.grantProjectMediaPermission(this)
             }
         }
     }
 
     /*
-     * Restores system settings altered via Shizuku upon recording completion.
+     * Restores system settings through the backend that started this session.
      */
-    private fun restoreShizukuFeaturesOnStop() {
-        if (ShizukuManager.isPermissionGranted()) {
-            if (hasChangedShowTouches || configManager.isShizukuShowTouchesEnabled) {
-                ShizukuManager.setShowTouches(false)
+    private fun restorePrivilegedFeaturesOnStop(onlyChanged: Boolean = false) {
+        if (PrivilegedAccessManager.isPermissionGranted()) {
+            if (hasChangedShowTouches || (!onlyChanged && configManager.isShizukuShowTouchesEnabled)) {
+                PrivilegedAccessManager.setShowTouches(false)
                 hasChangedShowTouches = false
             }
-            if (hasChangedImmersive || configManager.isShizukuHideSystemBarsEnabled) {
-                ShizukuManager.setImmersiveMode(false)
+            if (hasChangedImmersive || (!onlyChanged && configManager.isShizukuHideSystemBarsEnabled)) {
+                PrivilegedAccessManager.setImmersiveMode(false)
                 hasChangedImmersive = false
             }
         }
@@ -681,7 +706,7 @@ class ScreenRecordService : Service() {
         stopService(Intent(this, CameraOverlayService::class.java))
         stopService(Intent(this, DrawOverlayService::class.java))
 
-        restoreShizukuFeaturesOnStop()
+        PrivilegedAccessManager.runAsync(sessionUsesRoot) { restorePrivilegedFeaturesOnStop() }
         unregisterScreenStateReceiver()
         releaseWakeLock()
 
@@ -862,7 +887,16 @@ class ScreenRecordService : Service() {
      * Ensures all services, receivers, and hardware captures are cleanly released on destroy.
      */
     override fun onDestroy() {
+        serviceDestroyed = true
+        if (startupPending) {
+            // Enqueue rollback before a later session can enqueue its startup commands.
+            PrivilegedAccessManager.runAsync(sessionUsesRoot) { restorePrivilegedFeaturesOnStop(onlyChanged = true) }
+        }
+        isStarting = false
         stopRecording()
+        releaseWakeLock()
+        stopService(Intent(this, RecordingOverlayService::class.java))
+        RecordingStateManager.notifyListeners()
         super.onDestroy()
     }
 }
