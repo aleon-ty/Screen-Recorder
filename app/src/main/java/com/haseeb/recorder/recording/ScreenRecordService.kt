@@ -91,7 +91,17 @@ class ScreenRecordService : Service() {
     private var screenDensity = 0
     private var scaledDensity = 0
 
-    private var hasChangedShowTouches = false
+    private val showTouchesOverride = ShowTouchesOverride(
+        readEnabled = {
+            try {
+                Settings.System.getInt(contentResolver, "show_touches", 0) != 0
+            } catch (e: Exception) {
+                Log.w(TAG, "Cannot read Show Taps; leaving the setting unchanged", e)
+                null
+            }
+        },
+        writeEnabled = PrivilegedAccessManager::setShowTouches
+    )
     private var hasChangedImmersive = false
     private var wakeLock: PowerManager.WakeLock? = null
 
@@ -471,8 +481,7 @@ class ScreenRecordService : Service() {
     private fun applyPrivilegedFeaturesOnStart() {
         if (PrivilegedAccessManager.isPermissionGranted()) {
             if (configManager.isShizukuShowTouchesEnabled) {
-                val success = PrivilegedAccessManager.setShowTouches(true)
-                if (success) hasChangedShowTouches = true
+                showTouchesOverride.enableForRecording()
             }
             if (configManager.isShizukuHideSystemBarsEnabled) {
                 val success = PrivilegedAccessManager.setImmersiveMode(true)
@@ -491,11 +500,8 @@ class ScreenRecordService : Service() {
      * Restores system settings through the backend that started this session.
      */
     private fun restorePrivilegedFeaturesOnStop(onlyChanged: Boolean = false) {
+        showTouchesOverride.restore()
         if (PrivilegedAccessManager.isPermissionGranted()) {
-            if (hasChangedShowTouches || (!onlyChanged && configManager.isShizukuShowTouchesEnabled)) {
-                PrivilegedAccessManager.setShowTouches(false)
-                hasChangedShowTouches = false
-            }
             if (hasChangedImmersive || (!onlyChanged && configManager.isShizukuHideSystemBarsEnabled)) {
                 PrivilegedAccessManager.setImmersiveMode(false)
                 hasChangedImmersive = false
