@@ -1,4 +1,12 @@
 <resources>
+    <string name="privileged_features_header">Advanced Recording Controls</string>
+    <string name="privileged_backend_shizuku" translatable="false">Shizuku</string>
+    <string name="privileged_backend_root">Root</string>
+    <string name="privileged_backend_summary">Choose Shizuku or root access. Root requires a rooted device and approval from your root manager. The backend cannot be changed during recording.</string>
+    <string name="privileged_status_title">Access Status</string>
+    <string name="privileged_root_requesting">Waiting for root authorization…</string>
+    <string name="privileged_root_granted">Root access authorized</string>
+    <string name="privileged_root_unavailable">Root unavailable or denied — tap to retry</string>
 
     <string name="app_name">Screen Recorder</string>
 

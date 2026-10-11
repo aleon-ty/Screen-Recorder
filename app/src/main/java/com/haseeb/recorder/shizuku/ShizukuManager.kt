@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.util.Log
 import rikka.shizuku.Shizuku
+import com.haseeb.recorder.privileged.ShellCommandRunner
 
 /*
  * Manages Shizuku privileged service interactions, permission requests, and shell execution.
@@ -15,6 +16,7 @@ object ShizukuManager {
 
     private val permissionListeners = mutableListOf<(Boolean) -> Unit>()
     private val binderListeners = mutableListOf<() -> Unit>()
+    private var shouldRequestPermission: () -> Boolean = { true }
 
     private val internalPermissionListener = Shizuku.OnRequestPermissionResultListener { reqCode, grantResult ->
         if (reqCode == REQUEST_CODE_PERMISSION) {
@@ -25,7 +27,7 @@ object ShizukuManager {
 
     private val internalBinderReceivedListener = Shizuku.OnBinderReceivedListener {
         notifyBinderChanged()
-        requestPermissionSilent()
+        if (shouldRequestPermission()) requestPermissionSilent()
     }
 
     private val internalBinderDeadListener = Shizuku.OnBinderDeadListener {
@@ -35,12 +37,13 @@ object ShizukuManager {
     /*
      * Initializes Shizuku lifecycle listeners and silently requests permission if available.
      */
-    fun init() {
+    fun init(autoRequestPermission: () -> Boolean = { true }) {
+        shouldRequestPermission = autoRequestPermission
         try {
             Shizuku.addBinderReceivedListener(internalBinderReceivedListener)
             Shizuku.addBinderDeadListener(internalBinderDeadListener)
             Shizuku.addRequestPermissionResultListener(internalPermissionListener)
-            if (isShizukuRunning()) {
+            if (shouldRequestPermission() && isShizukuRunning()) {
                 requestPermissionSilent()
             }
         } catch (e: Exception) {
@@ -167,8 +170,7 @@ object ShizukuManager {
                 isAccessible = true
             }
             val process = newProcessMethod.invoke(null, arrayOf("sh", "-c", command), null, null) as Process
-            process.waitFor()
-            process.exitValue() == 0
+            ShellCommandRunner().runProcess(process).success
         } catch (e: Exception) {
             Log.e(TAG, "executeShell failed for command '$command': ${e.message}")
             false

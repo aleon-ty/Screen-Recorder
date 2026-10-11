@@ -111,6 +111,13 @@
 
 ### Shizuku Integration
 
+Advanced Recording Controls lets you select **Shizuku** (the default) or **Root**.
+Root requires an already-rooted device and authorization from its root manager;
+the app does not root your device. The selected backend powers the same advanced
+controls, and cannot be changed during recording. If root is unavailable or
+denied, normal screen recording remains available. Android may still require
+screen-capture confirmation depending on the OS and device.
+
 - 👆 Automatically enable Show Taps while recording
 - 📱 Automatically enable immersive mode for cleaner recordings
 - 🔊 Enhanced internal audio routing through Shizuku

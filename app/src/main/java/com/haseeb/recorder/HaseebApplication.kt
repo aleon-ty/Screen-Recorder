@@ -6,7 +6,7 @@ import androidx.appcompat.app.AppCompatDelegate
 import com.google.android.material.color.DynamicColors
 import com.google.android.material.color.DynamicColorsOptions
 import com.haseeb.recorder.data.ConfigManager
-import com.haseeb.recorder.shizuku.ShizukuManager
+import com.haseeb.recorder.privileged.PrivilegedAccessManager
 import com.haseeb.recorder.util.LocaleHelper
 
 /*
@@ -41,6 +41,6 @@ class HaseebApplication : Application() {
                 .build()
         )
 
-        ShizukuManager.init()
+        PrivilegedAccessManager.init(this)
     }
 }
