@@ -30,8 +30,6 @@ import com.haseeb.recorder.overlay.RecordingOverlayService
 import com.haseeb.recorder.shizuku.ShizukuManager
 import com.haseeb.recorder.ui.activity.MainActivity
 import java.io.File
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -254,6 +252,7 @@ class ScreenRecordService : Service() {
         lastVideoWrittenPtsUs = 0
         lastAudioWrittenPtsUs = 0
         
+        applyShizukuFeaturesOnStart()
         startRecording(resultCode, data)
     }
 
@@ -404,10 +403,10 @@ class ScreenRecordService : Service() {
             sendStateBroadcast(STATE_START)
 
             registerScreenStateReceiver()
-            applyShizukuFeaturesOnStart()
 
         } catch (e: Exception) {
             Log.e(TAG, "Start failed: ${e.message}")
+            restoreShizukuFeaturesOnStop()
             cleanup()
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -493,23 +492,80 @@ class ScreenRecordService : Service() {
             start()
         }
 
-        if (wantMic) {
-            val minBuf = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-            micRecord = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBuf * 4)
-        }
+        if (wantMic) micRecord = createAudioRecord(isMic = true)
+        if (wantSysAudio) sysRecord = createAudioRecord(isMic = false)
+    }
 
-        if (wantSysAudio && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+    private fun createAudioRecord(isMic: Boolean): AudioRecord {
+        val sampleRate = 48_000
+        val minBuf = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        check(minBuf > 0) { "Unsupported audio capture format" }
+        val record = if (isMic) {
+            AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBuf * 4)
+        } else {
+            check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
             val captureConfig = AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
                 .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                 .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
                 .build()
-            val minBuf = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-            sysRecord = AudioRecord.Builder()
+            AudioRecord.Builder()
                 .setAudioPlaybackCaptureConfig(captureConfig)
                 .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(sampleRate).setChannelMask(AudioFormat.CHANNEL_IN_MONO).build())
                 .setBufferSizeInBytes(minBuf * 4)
                 .build()
         }
+        if (record.state != AudioRecord.STATE_INITIALIZED) {
+            record.release()
+            error("Audio capture did not initialize")
+        }
+        return record
+    }
+
+    private var micRetryAfterMs = 0L
+    private var systemRetryAfterMs = 0L
+
+    private fun readAudioSource(isMic: Boolean, buffer: ShortArray, offset: Int, count: Int): Int {
+        if (stopRequested) return 0
+        var record = if (isMic) micRecord else sysRecord
+        val now = SystemClock.elapsedRealtime()
+        val retryAfter = if (isMic) micRetryAfterMs else systemRetryAfterMs
+        if (record == null && now >= retryAfter) {
+            try {
+                record = createAudioRecord(isMic)
+                if (stopRequested) {
+                    record.release()
+                    return 0
+                }
+                record.startRecording()
+                if (isMic) micRecord = record else sysRecord = record
+            } catch (e: Exception) {
+                try { record?.release() } catch (_: Exception) {}
+                Log.w(TAG, "Audio source restart failed (mic=$isMic)", e)
+                if (isMic) micRetryAfterMs = now + 1000 else systemRetryAfterMs = now + 1000
+                return 0
+            }
+        }
+        record ?: return 0
+        val samples = try {
+            record.read(buffer, offset, count, AudioRecord.READ_NON_BLOCKING)
+        } catch (e: Exception) {
+            if (!stopRequested) Log.w(TAG, "Audio source read failed (mic=$isMic)", e)
+            AudioRecord.ERROR_DEAD_OBJECT
+        }
+        if (samples < 0 && !stopRequested) {
+            Log.w(TAG, "Audio source returned $samples (mic=$isMic); recreating capture")
+            try { record.stop() } catch (_: Exception) {}
+            try { record.release() } catch (_: Exception) {}
+            if (isMic) {
+                micRecord = null
+                micRetryAfterMs = now + 1000
+            } else {
+                sysRecord = null
+                systemRetryAfterMs = now + 1000
+            }
+        }
+        return samples.coerceAtLeast(0)
     }
 
     /*
@@ -518,47 +574,29 @@ class ScreenRecordService : Service() {
     private fun drainAudioEncoder() {
         val bufferInfo = MediaCodec.BufferInfo()
         val encoder = audioEncoder ?: return
-        val frameSamples = 1024
-        val micBuf = ShortArray(frameSamples)
-        val sysBuf = ShortArray(frameSamples)
-        val mixBuf = ShortArray(frameSamples)
-        val tmpBytes = ByteArray(frameSamples * 2)
-
-        while (!stopRequested) {
-            if (isPaused) {
-                SystemClock.sleep(10)
-                continue
-            }
-
-            val micSamples = micRecord?.read(micBuf, 0, frameSamples) ?: 0
-            val sysSamples = sysRecord?.read(sysBuf, 0, frameSamples) ?: 0
-            val validSamples = maxOf(micSamples, sysSamples, 0)
-
-            if (validSamples > 0) {
-                if (isMuted) {
-                    mixBuf.fill(0)
+        val hasMic = micRecord != null
+        val hasSystem = sysRecord != null
+        val pump = AudioFramePump(
+            readMic = { buffer, offset, count -> if (hasMic) readAudioSource(true, buffer, offset, count) else 0 },
+            readSystem = { buffer, offset, count -> if (hasSystem) readAudioSource(false, buffer, offset, count) else 0 },
+            submit = { pcm, ptsUs ->
+                val inputIndex = encoder.dequeueInputBuffer(0)
+                if (inputIndex < 0) {
+                    false
                 } else {
-                    for (i in 0 until validSamples) {
-                        val mVal = if (i < micSamples) micBuf[i].toInt() else 0
-                        val sVal = if (i < sysSamples) sysBuf[i].toInt() else 0
-                        mixBuf[i] = (mVal + sVal).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
-                    }
-                }
-
-                val bb = ByteBuffer.wrap(tmpBytes).order(ByteOrder.LITTLE_ENDIAN)
-                bb.clear()
-                for (i in 0 until validSamples) bb.putShort(mixBuf[i])
-
-                val inputIndex = encoder.dequeueInputBuffer(10_000)
-                if (inputIndex >= 0) {
-                    encoder.getInputBuffer(inputIndex)?.apply {
-                        clear()
-                        put(tmpBytes, 0, validSamples * 2)
-                        encoder.queueInputBuffer(inputIndex, 0, validSamples * 2, System.nanoTime() / 1000, 0)
-                    }
+                    val input = checkNotNull(encoder.getInputBuffer(inputIndex))
+                    input.clear()
+                    input.put(pcm)
+                    encoder.queueInputBuffer(inputIndex, 0, pcm.size, ptsUs, 0)
+                    true
                 }
             }
+        )
+        while (!stopRequested) {
+            // Drain independently of source availability, pauses and codec backpressure.
             drainEncoderOutput(encoder, bufferInfo, isAudio = true)
+            pump.step(System.nanoTime() / 1000, isPaused, isMuted)
+            SystemClock.sleep(2)
         }
         val eosIndex = encoder.dequeueInputBuffer(10_000)
         if (eosIndex >= 0) encoder.queueInputBuffer(eosIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
