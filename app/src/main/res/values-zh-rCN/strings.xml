@@ -1,5 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="privileged_features_header">高级录屏控制</string>
+    <string name="privileged_backend_root">Root</string>
+    <string name="privileged_backend_summary">选择 Shizuku 或 Root 权限。Root 需要设备已获取 Root，并在 Root 管理器中授权。录制期间无法切换。</string>
+    <string name="privileged_status_title">权限状态</string>
+    <string name="privileged_root_requesting">等待 Root 授权…</string>
+    <string name="privileged_root_granted">已获得 Root 权限</string>
+    <string name="privileged_root_unavailable">Root 不可用或授权被拒绝，点击重试</string>
     <string name="app_name">屏幕录制</string>
     <string name="activity_about_title">关于</string>
     <string name="AboutActivity_title">关于</string>

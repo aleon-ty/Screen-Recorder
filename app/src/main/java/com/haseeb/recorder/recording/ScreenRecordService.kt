@@ -27,11 +27,10 @@ import com.haseeb.recorder.camera.CameraOverlayService
 import com.haseeb.recorder.data.ConfigManager
 import com.haseeb.recorder.draw.DrawOverlayService
 import com.haseeb.recorder.overlay.RecordingOverlayService
-import com.haseeb.recorder.shizuku.ShizukuManager
+import com.haseeb.recorder.privileged.PrivilegedAccessManager
 import com.haseeb.recorder.ui.activity.MainActivity
+import com.haseeb.recorder.ui.activity.CameraPermissionActivity
 import java.io.File
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -52,6 +51,7 @@ class ScreenRecordService : Service() {
         const val ACTION_RESUME = "com.haseeb.recorder.ACTION_RESUME"
         const val ACTION_TOGGLE_MUTE = "com.haseeb.recorder.ACTION_TOGGLE_MUTE"
         const val ACTION_TOGGLE_CAMERA = "com.haseeb.recorder.ACTION_TOGGLE_CAMERA"
+        const val ACTION_REFRESH_CAMERA = "com.haseeb.recorder.ACTION_REFRESH_CAMERA"
         const val ACTION_TOGGLE_DRAW = "com.haseeb.recorder.ACTION_TOGGLE_DRAW"
         
         const val ACTION_STATE_CHANGED = "com.haseeb.recorder.ACTION_STATE_CHANGED"
@@ -64,6 +64,8 @@ class ScreenRecordService : Service() {
         const val EXTRA_RESULT_CODE = "result_code"
         const val EXTRA_DATA = "data"
 
+        @Volatile var isStarting = false
+            private set
         @Volatile var isRecording = false
             private set
         @Volatile var isPaused = false
@@ -78,6 +80,9 @@ class ScreenRecordService : Service() {
         @Volatile private var lastAudioWrittenPtsUs = 0L
     }
 
+    @Volatile private var serviceDestroyed = false
+    private var startupPending = false
+    private var sessionUsesRoot = false
     private var mediaProjection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -88,7 +93,17 @@ class ScreenRecordService : Service() {
     private var screenDensity = 0
     private var scaledDensity = 0
 
-    private var hasChangedShowTouches = false
+    private val showTouchesOverride = ShowTouchesOverride(
+        readEnabled = {
+            try {
+                Settings.System.getInt(contentResolver, "show_touches", 0) != 0
+            } catch (e: Exception) {
+                Log.w(TAG, "Cannot read Show Taps; leaving the setting unchanged", e)
+                null
+            }
+        },
+        writeEnabled = PrivilegedAccessManager::setShowTouches
+    )
     private var hasChangedImmersive = false
     private var wakeLock: PowerManager.WakeLock? = null
 
@@ -103,8 +118,27 @@ class ScreenRecordService : Service() {
     private var audioTrackIndex = -1
     private var muxerStarted = false
     private var inputSurface: Surface? = null
+    private var rotationRenderer: AutoRotationRenderer? = null
+    private var captureScale = 1.0
+    private var captureWidth = 0
+    private var captureHeight = 0
+    private var displayListenerRegistered = false
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) {}
+        override fun onDisplayRemoved(displayId: Int) {}
+        override fun onDisplayChanged(displayId: Int) {
+            if (displayId == android.view.Display.DEFAULT_DISPLAY && Build.VERSION.SDK_INT < 34) {
+                val metrics = DisplayMetrics()
+                @Suppress("DEPRECATION")
+                (getSystemService(WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(metrics)
+                resizeCapture(metrics.widthPixels, metrics.heightPixels)
+            }
+        }
+    }
 
     private var micRecord: AudioRecord? = null
+    private var microphoneEffects: MicrophoneEffects? = null
+    private var cancelMicrophoneEcho = false
     private var sysRecord: AudioRecord? = null
 
     @Volatile private var audioRecordingThread: Thread? = null
@@ -134,6 +168,10 @@ class ScreenRecordService : Service() {
     }
 
     private val projectionCallback = object : MediaProjection.Callback() {
+        override fun onCapturedContentResize(width: Int, height: Int) {
+            resizeCapture(width, height)
+        }
+
         override fun onStop() {
             mainHandler.post {
                 stopRecording()
@@ -211,7 +249,7 @@ class ScreenRecordService : Service() {
                 if (CameraOverlayService.isCameraRunning) {
                     stopService(Intent(this, CameraOverlayService::class.java))
                 } else {
-                    startService(Intent(this, CameraOverlayService::class.java))
+                    if (isRecording) CameraPermissionActivity.launch(this)
                 }
                 mainHandler.postDelayed({
                     updateNotification()
@@ -219,6 +257,7 @@ class ScreenRecordService : Service() {
                     sendStateBroadcast("state_camera_changed")
                 }, 150)
             }
+            ACTION_REFRESH_CAMERA -> if (isRecording) updateNotification()
             ACTION_STOP -> {
                 stopRecording()
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -232,6 +271,11 @@ class ScreenRecordService : Service() {
      * Triggers the foreground notification and initializes data before recording starts.
      */
     private fun startRecordingSession(resultCode: Int, data: Intent) {
+        if (isRecording || isStarting) return
+        isStarting = true
+        startupPending = true
+        sessionUsesRoot = PrivilegedAccessManager.usesRoot
+        RecordingStateManager.notifyListeners()
         val wantsAudio = (configManager.isMicEnabled || configManager.isSystemAudioEnabled)
         val hasAudioPerm = checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
         val canRecordAudio = wantsAudio && hasAudioPerm
@@ -254,7 +298,23 @@ class ScreenRecordService : Service() {
         lastVideoWrittenPtsUs = 0
         lastAudioWrittenPtsUs = 0
         
-        startRecording(resultCode, data)
+        if (!PrivilegedAccessManager.isPermissionGranted()) {
+            isStarting = false
+            startupPending = false
+            startRecording(resultCode, data)
+            return
+        }
+        PrivilegedAccessManager.runAsync(sessionUsesRoot) {
+            if (!serviceDestroyed) applyPrivilegedFeaturesOnStart()
+            mainHandler.post {
+                startupPending = false
+                if (!serviceDestroyed) {
+                    isStarting = false
+                    startRecording(resultCode, data)
+                }
+                RecordingStateManager.notifyListeners()
+            }
+        }
     }
 
     /*
@@ -375,6 +435,20 @@ class ScreenRecordService : Service() {
                 start()
             }
 
+            if (configManager.videoOrientation == ConfigManager.ORIENTATION_AUTO) {
+                captureScale = screenWidth.toDouble() / physicalMaxRes.first
+                captureWidth = screenWidth
+                captureHeight = screenHeight
+                rotationRenderer = AutoRotationRenderer(checkNotNull(inputSurface), screenWidth, screenHeight) { error ->
+                    mainHandler.post {
+                        Log.e(TAG, "Rotation rendering failed", error)
+                        stopRecording()
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                    }
+                }
+            }
+
             if (hasAnyAudio) setupAudioEncoders(wantMic, wantSysAudio)
 
             mediaMuxer = if (outputFileDescriptor != null) {
@@ -386,8 +460,13 @@ class ScreenRecordService : Service() {
             virtualDisplay = mediaProjection?.createVirtualDisplay(
                 getString(R.string.ScreenRecordService_virtual_display_name),
                 screenWidth, screenHeight, scaledDensity,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, inputSurface, null, null
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, rotationRenderer?.surface ?: inputSurface, null, null
             )
+
+            if (rotationRenderer != null && Build.VERSION.SDK_INT < 34) {
+                getSystemService(DisplayManager::class.java).registerDisplayListener(displayListener, mainHandler)
+                displayListenerRegistered = true
+            }
 
             if (hasAnyAudio) {
                 micRecord?.startRecording()
@@ -404,11 +483,32 @@ class ScreenRecordService : Service() {
             sendStateBroadcast(STATE_START)
 
             registerScreenStateReceiver()
-            applyShizukuFeaturesOnStart()
 
         } catch (e: Exception) {
             Log.e(TAG, "Start failed: ${e.message}")
+            PrivilegedAccessManager.runAsync(sessionUsesRoot) { restorePrivilegedFeaturesOnStop() }
             cleanup()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+    }
+
+    private fun resizeCapture(width: Int, height: Int) {
+        val renderer = rotationRenderer ?: return
+        val display = virtualDisplay ?: return
+        if (stopRequested || width <= 0 || height <= 0) return
+        val (newWidth, newHeight) = RecordingFrameLayout.captureSize(width, height, captureScale)
+        if (captureWidth == newWidth && captureHeight == newHeight) return
+        try {
+            display.setSurface(null)
+            renderer.resize(newWidth, newHeight)
+            display.resize(newWidth, newHeight, scaledDensity)
+            captureWidth = newWidth
+            captureHeight = newHeight
+            if (!isPaused) display.setSurface(renderer.surface)
+        } catch (e: Exception) {
+            Log.e(TAG, "Capture resize failed", e)
+            stopRecording()
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
@@ -442,38 +542,34 @@ class ScreenRecordService : Service() {
     }
 
     /*
-     * Applies privileged Shizuku settings at the beginning of recording session.
+     * Applies advanced settings through the selected backend before capture starts.
      */
-    private fun applyShizukuFeaturesOnStart() {
-        if (ShizukuManager.isPermissionGranted()) {
+    private fun applyPrivilegedFeaturesOnStart() {
+        if (PrivilegedAccessManager.isPermissionGranted()) {
             if (configManager.isShizukuShowTouchesEnabled) {
-                val success = ShizukuManager.setShowTouches(true)
-                if (success) hasChangedShowTouches = true
+                showTouchesOverride.enableForRecording()
             }
             if (configManager.isShizukuHideSystemBarsEnabled) {
-                val success = ShizukuManager.setImmersiveMode(true)
+                val success = PrivilegedAccessManager.setImmersiveMode(true)
                 if (success) hasChangedImmersive = true
             }
             if (configManager.isShizukuEnhancedAudioEnabled) {
-                ShizukuManager.grantEnhancedAudioPermission(this)
+                PrivilegedAccessManager.grantEnhancedAudioPermission(this)
             }
             if (configManager.isShizukuDirectRecordingEnabled) {
-                ShizukuManager.grantProjectMediaPermission(this)
+                PrivilegedAccessManager.grantProjectMediaPermission(this)
             }
         }
     }
 
     /*
-     * Restores system settings altered via Shizuku upon recording completion.
+     * Restores system settings through the backend that started this session.
      */
-    private fun restoreShizukuFeaturesOnStop() {
-        if (ShizukuManager.isPermissionGranted()) {
-            if (hasChangedShowTouches || configManager.isShizukuShowTouchesEnabled) {
-                ShizukuManager.setShowTouches(false)
-                hasChangedShowTouches = false
-            }
-            if (hasChangedImmersive || configManager.isShizukuHideSystemBarsEnabled) {
-                ShizukuManager.setImmersiveMode(false)
+    private fun restorePrivilegedFeaturesOnStop(onlyChanged: Boolean = false) {
+        showTouchesOverride.restore()
+        if (PrivilegedAccessManager.isPermissionGranted()) {
+            if (hasChangedImmersive || (!onlyChanged && configManager.isShizukuHideSystemBarsEnabled)) {
+                PrivilegedAccessManager.setImmersiveMode(false)
                 hasChangedImmersive = false
             }
         }
@@ -493,23 +589,104 @@ class ScreenRecordService : Service() {
             start()
         }
 
-        if (wantMic) {
-            val minBuf = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-            micRecord = AudioRecord(MediaRecorder.AudioSource.MIC, sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, minBuf * 4)
-        }
+        cancelMicrophoneEcho = wantMic && wantSysAudio
+        if (wantMic) micRecord = createAudioRecord(isMic = true)
+        if (wantSysAudio) sysRecord = createAudioRecord(isMic = false)
+    }
 
-        if (wantSysAudio && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+    private fun createAudioRecord(isMic: Boolean): AudioRecord {
+        val sampleRate = 48_000
+        val minBuf = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        check(minBuf > 0) { "Unsupported audio capture format" }
+        val record = if (isMic) {
+            createMicrophoneRecord(sampleRate, minBuf * 4)
+        } else {
+            check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
             val captureConfig = AudioPlaybackCaptureConfiguration.Builder(mediaProjection!!)
                 .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                 .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
                 .build()
-            val minBuf = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-            sysRecord = AudioRecord.Builder()
+            AudioRecord.Builder()
                 .setAudioPlaybackCaptureConfig(captureConfig)
                 .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(sampleRate).setChannelMask(AudioFormat.CHANNEL_IN_MONO).build())
                 .setBufferSizeInBytes(minBuf * 4)
                 .build()
         }
+        if (record.state != AudioRecord.STATE_INITIALIZED) {
+            record.release()
+            error("Audio capture did not initialize")
+        }
+        if (isMic) {
+            microphoneEffects?.close()
+            microphoneEffects = MicrophoneEffects(record.audioSessionId, cancelMicrophoneEcho)
+        }
+        return record
+    }
+
+    private fun createMicrophoneRecord(sampleRate: Int, bufferSize: Int): AudioRecord {
+        val sources = if (cancelMicrophoneEcho) {
+            intArrayOf(MediaRecorder.AudioSource.VOICE_COMMUNICATION, MediaRecorder.AudioSource.MIC)
+        } else intArrayOf(MediaRecorder.AudioSource.MIC)
+        for (source in sources) {
+            try {
+                val record = AudioRecord(source, sampleRate, AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT, bufferSize)
+                if (record.state == AudioRecord.STATE_INITIALIZED) return record
+                record.release()
+            } catch (e: RuntimeException) {
+                Log.w(TAG, "Microphone source $source unavailable", e)
+            }
+        }
+        error("Microphone capture did not initialize")
+    }
+
+    private var micRetryAfterMs = 0L
+    private var systemRetryAfterMs = 0L
+
+    private fun readAudioSource(isMic: Boolean, buffer: ShortArray, offset: Int, count: Int): Int {
+        if (stopRequested) return 0
+        var record = if (isMic) micRecord else sysRecord
+        val now = SystemClock.elapsedRealtime()
+        val retryAfter = if (isMic) micRetryAfterMs else systemRetryAfterMs
+        if (record == null && now >= retryAfter) {
+            try {
+                record = createAudioRecord(isMic)
+                if (stopRequested) {
+                    record.release()
+                    return 0
+                }
+                record.startRecording()
+                if (isMic) micRecord = record else sysRecord = record
+            } catch (e: Exception) {
+                if (isMic) { microphoneEffects?.close(); microphoneEffects = null }
+                try { record?.release() } catch (_: Exception) {}
+                Log.w(TAG, "Audio source restart failed (mic=$isMic)", e)
+                if (isMic) micRetryAfterMs = now + 1000 else systemRetryAfterMs = now + 1000
+                return 0
+            }
+        }
+        record ?: return 0
+        val samples = try {
+            record.read(buffer, offset, count, AudioRecord.READ_NON_BLOCKING)
+        } catch (e: Exception) {
+            if (!stopRequested) Log.w(TAG, "Audio source read failed (mic=$isMic)", e)
+            AudioRecord.ERROR_DEAD_OBJECT
+        }
+        if (samples < 0 && !stopRequested) {
+            Log.w(TAG, "Audio source returned $samples (mic=$isMic); recreating capture")
+            try { record.stop() } catch (_: Exception) {}
+            try { record.release() } catch (_: Exception) {}
+            if (isMic) {
+                microphoneEffects?.close(); microphoneEffects = null
+                micRecord = null
+                micRetryAfterMs = now + 1000
+            } else {
+                sysRecord = null
+                systemRetryAfterMs = now + 1000
+            }
+        }
+        return samples.coerceAtLeast(0)
     }
 
     /*
@@ -518,47 +695,29 @@ class ScreenRecordService : Service() {
     private fun drainAudioEncoder() {
         val bufferInfo = MediaCodec.BufferInfo()
         val encoder = audioEncoder ?: return
-        val frameSamples = 1024
-        val micBuf = ShortArray(frameSamples)
-        val sysBuf = ShortArray(frameSamples)
-        val mixBuf = ShortArray(frameSamples)
-        val tmpBytes = ByteArray(frameSamples * 2)
-
-        while (!stopRequested) {
-            if (isPaused) {
-                SystemClock.sleep(10)
-                continue
-            }
-
-            val micSamples = micRecord?.read(micBuf, 0, frameSamples) ?: 0
-            val sysSamples = sysRecord?.read(sysBuf, 0, frameSamples) ?: 0
-            val validSamples = maxOf(micSamples, sysSamples, 0)
-
-            if (validSamples > 0) {
-                if (isMuted) {
-                    mixBuf.fill(0)
+        val hasMic = micRecord != null
+        val hasSystem = sysRecord != null
+        val pump = AudioFramePump(
+            readMic = { buffer, offset, count -> if (hasMic) readAudioSource(true, buffer, offset, count) else 0 },
+            readSystem = { buffer, offset, count -> if (hasSystem) readAudioSource(false, buffer, offset, count) else 0 },
+            submit = { pcm, ptsUs ->
+                val inputIndex = encoder.dequeueInputBuffer(0)
+                if (inputIndex < 0) {
+                    false
                 } else {
-                    for (i in 0 until validSamples) {
-                        val mVal = if (i < micSamples) micBuf[i].toInt() else 0
-                        val sVal = if (i < sysSamples) sysBuf[i].toInt() else 0
-                        mixBuf[i] = (mVal + sVal).coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
-                    }
-                }
-
-                val bb = ByteBuffer.wrap(tmpBytes).order(ByteOrder.LITTLE_ENDIAN)
-                bb.clear()
-                for (i in 0 until validSamples) bb.putShort(mixBuf[i])
-
-                val inputIndex = encoder.dequeueInputBuffer(10_000)
-                if (inputIndex >= 0) {
-                    encoder.getInputBuffer(inputIndex)?.apply {
-                        clear()
-                        put(tmpBytes, 0, validSamples * 2)
-                        encoder.queueInputBuffer(inputIndex, 0, validSamples * 2, System.nanoTime() / 1000, 0)
-                    }
+                    val input = checkNotNull(encoder.getInputBuffer(inputIndex))
+                    input.clear()
+                    input.put(pcm)
+                    encoder.queueInputBuffer(inputIndex, 0, pcm.size, ptsUs, 0)
+                    true
                 }
             }
+        )
+        while (!stopRequested) {
+            // Drain independently of source availability, pauses and codec backpressure.
             drainEncoderOutput(encoder, bufferInfo, isAudio = true)
+            pump.step(System.nanoTime() / 1000, isPaused, isMuted)
+            SystemClock.sleep(2)
         }
         val eosIndex = encoder.dequeueInputBuffer(10_000)
         if (eosIndex >= 0) encoder.queueInputBuffer(eosIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
@@ -634,6 +793,9 @@ class ScreenRecordService : Service() {
      */
      private fun stopRecording() {
         if (!isRecording) return
+        virtualDisplay?.setSurface(null)
+        rotationRenderer?.close()
+        rotationRenderer = null
         stopRequested = true
         isPaused = false
         isMuted = false
@@ -643,7 +805,7 @@ class ScreenRecordService : Service() {
         stopService(Intent(this, CameraOverlayService::class.java))
         stopService(Intent(this, DrawOverlayService::class.java))
 
-        restoreShizukuFeaturesOnStop()
+        PrivilegedAccessManager.runAsync(sessionUsesRoot) { restorePrivilegedFeaturesOnStop() }
         unregisterScreenStateReceiver()
         releaseWakeLock()
 
@@ -662,6 +824,13 @@ class ScreenRecordService : Service() {
      * Thoroughly frees system memory objects required by projection services.
      */
     private fun cleanup() {
+        microphoneEffects?.close(); microphoneEffects = null
+        if (displayListenerRegistered) {
+            getSystemService(DisplayManager::class.java).unregisterDisplayListener(displayListener)
+            displayListenerRegistered = false
+        }
+        virtualDisplay?.release(); virtualDisplay = null
+        rotationRenderer?.close(); rotationRenderer = null
         micRecord?.release(); micRecord = null
         sysRecord?.release(); sysRecord = null
         try { audioEncoder?.stop() } catch (_: Exception) {}; audioEncoder?.release(); audioEncoder = null
@@ -670,7 +839,6 @@ class ScreenRecordService : Service() {
         try { mediaMuxer?.release() } catch (_: Exception) {}; mediaMuxer = null
         muxerStarted = false
         try { outputFileDescriptor?.close() } catch (_: Exception) {}; outputFileDescriptor = null
-        virtualDisplay?.release(); virtualDisplay = null
         mediaProjection?.stop(); mediaProjection = null
         releaseWakeLock()
     }
@@ -703,7 +871,7 @@ class ScreenRecordService : Service() {
         val resumeTimeUs = System.nanoTime() / 1000
         totalPausedDurationUs += (resumeTimeUs - pauseStartTimeUs)
         isPaused = false
-        inputSurface?.let { virtualDisplay?.setSurface(it) }
+        (rotationRenderer?.surface ?: inputSurface)?.let { virtualDisplay?.setSurface(it) }
         RecordingStateManager.onRecordingResumed()
         sendStateBroadcast(STATE_RESUME)
         updateNotification()
@@ -731,7 +899,7 @@ class ScreenRecordService : Service() {
         val stopIntent = PendingIntent.getService(this, 0, Intent(this, ScreenRecordService::class.java).apply { action = ACTION_STOP }, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val pauseResumeIntent = PendingIntent.getService(this, 1, Intent(this, ScreenRecordService::class.java).apply { action = if (isPaused) ACTION_RESUME else ACTION_PAUSE }, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val muteIntent = PendingIntent.getService(this, 2, Intent(this, ScreenRecordService::class.java).apply { action = ACTION_TOGGLE_MUTE }, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        val cameraIntent = PendingIntent.getService(this, 3, Intent(this, ScreenRecordService::class.java).apply { action = ACTION_TOGGLE_CAMERA }, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+        val cameraIntent = PendingIntent.getActivity(this, 3, Intent(this, CameraPermissionActivity::class.java), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         val drawIntent = PendingIntent.getService(this, 4, Intent(this, ScreenRecordService::class.java).apply { action = ACTION_TOGGLE_DRAW }, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
 
         val contentIntent = PendingIntent.getActivity(
@@ -824,7 +992,16 @@ class ScreenRecordService : Service() {
      * Ensures all services, receivers, and hardware captures are cleanly released on destroy.
      */
     override fun onDestroy() {
+        serviceDestroyed = true
+        if (startupPending) {
+            // Enqueue rollback before a later session can enqueue its startup commands.
+            PrivilegedAccessManager.runAsync(sessionUsesRoot) { restorePrivilegedFeaturesOnStop(onlyChanged = true) }
+        }
+        isStarting = false
         stopRecording()
+        releaseWakeLock()
+        stopService(Intent(this, RecordingOverlayService::class.java))
+        RecordingStateManager.notifyListeners()
         super.onDestroy()
     }
 }

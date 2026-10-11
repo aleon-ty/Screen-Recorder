@@ -20,7 +20,7 @@ import android.Manifest
 import com.haseeb.recorder.R
 import com.haseeb.recorder.data.ConfigManager
 import com.haseeb.recorder.recording.ScreenRecordService
-import com.haseeb.recorder.shizuku.ShizukuManager
+import com.haseeb.recorder.privileged.PrivilegedAccessManager
 import com.haseeb.recorder.util.LocaleHelper
 
 /*
@@ -29,7 +29,7 @@ import com.haseeb.recorder.util.LocaleHelper
  * Handles background-to-foreground transition to prevent Android 14+ crash
  * when starting MediaProjection from a background activity.
  */
-class MediaProjectionPermissionActivity : Activity() {
+open class MediaProjectionPermissionActivity : Activity() {
 
     companion object {
         private const val TAG = "MediaProjectionActivity"
@@ -82,8 +82,16 @@ class MediaProjectionPermissionActivity : Activity() {
         if (isProjectionRequestPending) return
         if (!checkRuntimePermissions()) return
         if (!checkOverlayPermission()) return
-        if (ShizukuManager.isPermissionGranted() && configManager.isShizukuDirectRecordingEnabled) {
-            ShizukuManager.grantProjectMediaPermission(this)
+        if (PrivilegedAccessManager.isPermissionGranted() && configManager.isShizukuDirectRecordingEnabled) {
+            isProjectionRequestPending = true
+            PrivilegedAccessManager.runAsync {
+                PrivilegedAccessManager.grantProjectMediaPermission(applicationContext)
+                runOnUiThread {
+                    isProjectionRequestPending = false
+                    if (!isFinishing && !isDestroyed) requestMediaProjection()
+                }
+            }
+            return
         }
         requestMediaProjection()
     }
@@ -271,7 +279,7 @@ class MediaProjectionPermissionActivity : Activity() {
         } catch (e: Exception) {
             Log.w(TAG, "moveTaskToFront failed, using fallback: ${e.message}")
             try {
-                val intent = Intent(this, MediaProjectionPermissionActivity::class.java).apply {
+                val intent = Intent(this, javaClass).apply {
                     addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP)
                 }
                 startActivity(intent)

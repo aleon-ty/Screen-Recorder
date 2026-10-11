@@ -10,8 +10,8 @@ android {
         applicationId = "com.haseeb.recorder"
         minSdk = 26
         targetSdk = 37
-        versionCode = 6
-        versionName = "4.0"
+        versionCode = 7
+        versionName = "5.1"
     }
 
     dependenciesInfo {
@@ -44,6 +44,7 @@ android {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
     implementation("androidx.activity:activity-ktx:1.13.0")
     implementation("androidx.appcompat:appcompat:1.8.0")
     implementation("com.google.android.material:material:1.14.0")

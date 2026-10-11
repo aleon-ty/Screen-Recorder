@@ -84,7 +84,7 @@
 - 🎞️ Multiple video codec options for better compatibility and compression
 - 🎚️ FPS controls with multiple frame rate options
 - 📊 Bitrate controls with automatic and manual settings
-- 🔄 Screen orientation controls for different recording layouts
+- 🔄 Screen orientation controls for different recording layouts. Auto follows portrait/landscape changes in one continuous video, fitting the screen into the starting frame with black bars when needed.
 - 🎙️ Audio source controls for internal audio and microphone recording
 - 🎚️ Audio quality controls with multiple sample rate options
 - ⏱️ Customizable countdown before recording starts
@@ -110,6 +110,13 @@
 - 👆 Touch-through mode lets you use the app underneath your annotations
 
 ### Shizuku Integration
+
+Advanced Recording Controls lets you select **Shizuku** (the default) or **Root**.
+Root requires an already-rooted device and authorization from its root manager;
+the app does not root your device. The selected backend powers the same advanced
+controls, and cannot be changed during recording. If root is unavailable or
+denied, normal screen recording remains available. Android may still require
+screen-capture confirmation depending on the OS and device.
 
 - 👆 Automatically enable Show Taps while recording
 - 📱 Automatically enable immersive mode for cleaner recordings

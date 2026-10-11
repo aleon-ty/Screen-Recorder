@@ -21,6 +21,8 @@ import com.haseeb.recorder.databinding.SheetSettingsBinding
 import com.haseeb.recorder.overlay.RecordingOverlayService
 import com.haseeb.recorder.recording.ScreenRecordService
 import com.haseeb.recorder.shizuku.ShizukuManager
+import com.haseeb.recorder.privileged.PrivilegedAccessManager
+import com.haseeb.recorder.recording.RecordingStateManager
 import com.haseeb.recorder.ui.activity.AboutActivity
 import com.haseeb.recorder.util.LocaleHelper
 
@@ -28,7 +30,7 @@ import com.haseeb.recorder.util.LocaleHelper
  * Manages the settings bottom sheet dialog.
  * Handles audio, video quality, encoder, orientation, storage, lock screen, Shizuku, and theme configurations.
  */
-class SettingsBottomSheet : BottomSheetDialogFragment() {
+class SettingsBottomSheet : BottomSheetDialogFragment(), RecordingStateManager.StateListener {
 
     private var _binding: SheetSettingsBinding? = null
     private val binding get() = _binding!!
@@ -36,26 +38,15 @@ class SettingsBottomSheet : BottomSheetDialogFragment() {
     private lateinit var configManager: ConfigManager
     private var isProgrammaticShizukuUpdate = false
 
-    private val shizukuPermissionListener: (Boolean) -> Unit = { granted ->
-        activity?.runOnUiThread {
-            if (granted) {
-                if (configManager.isShizukuDirectRecordingEnabled) {
-                    context?.let { ShizukuManager.grantProjectMediaPermission(it) }
-                }
-                if (configManager.isShizukuEnhancedAudioEnabled) {
-                    context?.let { ShizukuManager.grantEnhancedAudioPermission(it) }
-                }
-            }
-            updateShizukuUI()
+    private val privilegedPermissionListener: (Boolean) -> Unit = {
+        if (_binding != null) {
+            updatePrivilegedUI()
             setupDynamicFps()
         }
     }
 
-    private val shizukuBinderListener: () -> Unit = {
-        activity?.runOnUiThread {
-            updateShizukuUI()
-            setupDynamicFps()
-        }
+    override fun onStateChanged() {
+        if (_binding != null) updatePrivilegedUI()
     }
 
     private val storagePickerLauncher = registerForActivityResult(
@@ -97,8 +88,8 @@ class SettingsBottomSheet : BottomSheetDialogFragment() {
             requireActivity().window.isNavigationBarContrastEnforced = false
         }
 
-        ShizukuManager.addPermissionListener(shizukuPermissionListener)
-        ShizukuManager.addBinderListener(shizukuBinderListener)
+        PrivilegedAccessManager.addPermissionListener(privilegedPermissionListener)
+        RecordingStateManager.addListener(this)
 
         setupDynamicQualities()
         setupDynamicFps()
@@ -220,64 +211,41 @@ class SettingsBottomSheet : BottomSheetDialogFragment() {
         binding.buttonGroupTheme.check(themeButtonId)
 
         updateLanguageUI()
-        updateShizukuUI()
+        updatePrivilegedUI()
     }
 
     /*
-     * Updates the status and accessibility of Shizuku-related features based on server connection and permissions.
+     * Updates advanced controls for the selected privilege provider and recording state.
      */
-    private fun updateShizukuUI() {
-        val hasPermission = ShizukuManager.isPermissionGranted()
-        val isRunning = ShizukuManager.isShizukuRunning()
-
+    private fun updatePrivilegedUI() {
+        val hasPermission = PrivilegedAccessManager.isPermissionGranted()
+        val rootSelected = PrivilegedAccessManager.usesRoot
+        val requesting = PrivilegedAccessManager.isRequestingPermission
+        val canSwitch = !ScreenRecordService.isRecording && !ScreenRecordService.isStarting && !requesting
         isProgrammaticShizukuUpdate = true
         try {
+            binding.buttonGroupPrivilegedBackend.check(if (rootSelected) R.id.btnBackendRoot else R.id.btnBackendShizuku)
+            binding.btnBackendRoot.isEnabled = canSwitch
+            binding.btnBackendShizuku.isEnabled = canSwitch
             binding.switchShizukuShowTouches.isChecked = configManager.isShizukuShowTouchesEnabled
             binding.switchShizukuDirectRecording.isChecked = configManager.isShizukuDirectRecordingEnabled
             binding.switchShizukuHideSystemBars.isChecked = configManager.isShizukuHideSystemBarsEnabled
             binding.switchShizukuEnhancedAudio.isChecked = configManager.isShizukuEnhancedAudioEnabled
-
-            if (hasPermission) {
-                binding.tvShizukuStatus.text = getString(R.string.SettingsBottomSheet_shizuku_status_granted)
-
-                binding.cardShizukuShowTouches.isEnabled = true
-                binding.cardShizukuShowTouches.alpha = 1.0f
-                binding.switchShizukuShowTouches.isEnabled = true
-
-                binding.cardShizukuDirectRecording.isEnabled = true
-                binding.cardShizukuDirectRecording.alpha = 1.0f
-                binding.switchShizukuDirectRecording.isEnabled = true
-
-                binding.cardShizukuHideSystemBars.isEnabled = true
-                binding.cardShizukuHideSystemBars.alpha = 1.0f
-                binding.switchShizukuHideSystemBars.isEnabled = true
-
-                binding.cardShizukuEnhancedAudio.isEnabled = true
-                binding.cardShizukuEnhancedAudio.alpha = 1.0f
-                binding.switchShizukuEnhancedAudio.isEnabled = true
-            } else {
-                if (isRunning) {
-                    binding.tvShizukuStatus.text = getString(R.string.SettingsBottomSheet_shizuku_status_waiting)
-                } else {
-                    binding.tvShizukuStatus.text = getString(R.string.SettingsBottomSheet_shizuku_status_unavailable)
-                }
-
-                binding.cardShizukuShowTouches.isEnabled = false
-                binding.cardShizukuShowTouches.alpha = 0.5f
-                binding.switchShizukuShowTouches.isEnabled = false
-
-                binding.cardShizukuDirectRecording.isEnabled = false
-                binding.cardShizukuDirectRecording.alpha = 0.5f
-                binding.switchShizukuDirectRecording.isEnabled = false
-
-                binding.cardShizukuHideSystemBars.isEnabled = false
-                binding.cardShizukuHideSystemBars.alpha = 0.5f
-                binding.switchShizukuHideSystemBars.isEnabled = false
-
-                binding.cardShizukuEnhancedAudio.isEnabled = false
-                binding.cardShizukuEnhancedAudio.alpha = 0.5f
-                binding.switchShizukuEnhancedAudio.isEnabled = false
+            val status = when {
+                requesting -> R.string.privileged_root_requesting
+                rootSelected && hasPermission -> R.string.privileged_root_granted
+                rootSelected -> R.string.privileged_root_unavailable
+                hasPermission -> R.string.SettingsBottomSheet_shizuku_status_granted
+                ShizukuManager.isShizukuRunning() -> R.string.SettingsBottomSheet_shizuku_status_waiting
+                else -> R.string.SettingsBottomSheet_shizuku_status_unavailable
             }
+            binding.tvShizukuStatus.setText(status)
+            val controls = listOf(binding.cardShizukuShowTouches, binding.cardShizukuDirectRecording,
+                binding.cardShizukuHideSystemBars, binding.cardShizukuEnhancedAudio)
+            val switches = listOf(binding.switchShizukuShowTouches, binding.switchShizukuDirectRecording,
+                binding.switchShizukuHideSystemBars, binding.switchShizukuEnhancedAudio)
+            controls.forEach { it.isEnabled = hasPermission; it.alpha = if (hasPermission) 1f else 0.5f }
+            switches.forEach { it.isEnabled = hasPermission }
         } finally {
             isProgrammaticShizukuUpdate = false
         }
@@ -310,6 +278,17 @@ class SettingsBottomSheet : BottomSheetDialogFragment() {
      * Attaches click and change listeners to all interactive user interface controls.
      */
     private fun setupListeners() {
+        binding.buttonGroupPrivilegedBackend.addOnButtonCheckedListener { _, checkedId, isChecked ->
+            if (isChecked && !isProgrammaticShizukuUpdate) {
+                if (ScreenRecordService.isRecording || ScreenRecordService.isStarting) {
+                    updatePrivilegedUI()
+                    return@addOnButtonCheckedListener
+                }
+                val backend = if (checkedId == R.id.btnBackendRoot) ConfigManager.BACKEND_ROOT else ConfigManager.BACKEND_SHIZUKU
+                PrivilegedAccessManager.selectBackend(backend)
+                updatePrivilegedUI()
+            }
+        }
         binding.cardMic.setOnClickListener { binding.switchMic.toggle() }
         binding.switchMic.setOnCheckedChangeListener { _, isChecked ->
             configManager.isMicEnabled = isChecked
@@ -508,60 +487,62 @@ class SettingsBottomSheet : BottomSheetDialogFragment() {
         }
 
         binding.cardShizukuStatus.setOnClickListener {
-            if (!ShizukuManager.isPermissionGranted()) {
-                ShizukuManager.requestPermissionExplicit()
+            if (!PrivilegedAccessManager.isPermissionGranted() && !ScreenRecordService.isRecording && !ScreenRecordService.isStarting) {
+                PrivilegedAccessManager.requestPermission()
             }
         }
 
         binding.cardShizukuShowTouches.setOnClickListener {
-            if (ShizukuManager.isPermissionGranted()) {
+            if (PrivilegedAccessManager.isPermissionGranted()) {
                 binding.switchShizukuShowTouches.toggle()
             }
         }
         binding.switchShizukuShowTouches.setOnCheckedChangeListener { _, isChecked ->
             if (isProgrammaticShizukuUpdate) return@setOnCheckedChangeListener
             configManager.isShizukuShowTouchesEnabled = isChecked
-            if (ScreenRecordService.isRecording && ShizukuManager.isPermissionGranted()) {
-                ShizukuManager.setShowTouches(isChecked)
+            if (ScreenRecordService.isRecording && PrivilegedAccessManager.isPermissionGranted()) {
+                PrivilegedAccessManager.runAsync { PrivilegedAccessManager.setShowTouches(isChecked) }
             }
         }
 
         binding.cardShizukuDirectRecording.setOnClickListener {
-            if (ShizukuManager.isPermissionGranted()) {
+            if (PrivilegedAccessManager.isPermissionGranted()) {
                 binding.switchShizukuDirectRecording.toggle()
             }
         }
         binding.switchShizukuDirectRecording.setOnCheckedChangeListener { _, isChecked ->
             if (isProgrammaticShizukuUpdate) return@setOnCheckedChangeListener
             configManager.isShizukuDirectRecordingEnabled = isChecked
-            if (isChecked && ShizukuManager.isPermissionGranted()) {
-                ShizukuManager.grantProjectMediaPermission(requireContext())
+            if (isChecked && PrivilegedAccessManager.isPermissionGranted()) {
+                val appContext = requireContext().applicationContext
+                PrivilegedAccessManager.runAsync { PrivilegedAccessManager.grantProjectMediaPermission(appContext) }
             }
         }
 
         binding.cardShizukuHideSystemBars.setOnClickListener {
-            if (ShizukuManager.isPermissionGranted()) {
+            if (PrivilegedAccessManager.isPermissionGranted()) {
                 binding.switchShizukuHideSystemBars.toggle()
             }
         }
         binding.switchShizukuHideSystemBars.setOnCheckedChangeListener { _, isChecked ->
             if (isProgrammaticShizukuUpdate) return@setOnCheckedChangeListener
             configManager.isShizukuHideSystemBarsEnabled = isChecked
-            if (ScreenRecordService.isRecording && ShizukuManager.isPermissionGranted()) {
-                ShizukuManager.setImmersiveMode(isChecked)
+            if (ScreenRecordService.isRecording && PrivilegedAccessManager.isPermissionGranted()) {
+                PrivilegedAccessManager.runAsync { PrivilegedAccessManager.setImmersiveMode(isChecked) }
             }
         }
 
         binding.cardShizukuEnhancedAudio.setOnClickListener {
-            if (ShizukuManager.isPermissionGranted()) {
+            if (PrivilegedAccessManager.isPermissionGranted()) {
                 binding.switchShizukuEnhancedAudio.toggle()
             }
         }
         binding.switchShizukuEnhancedAudio.setOnCheckedChangeListener { _, isChecked ->
             if (isProgrammaticShizukuUpdate) return@setOnCheckedChangeListener
             configManager.isShizukuEnhancedAudioEnabled = isChecked
-            if (isChecked && ShizukuManager.isPermissionGranted()) {
-                ShizukuManager.grantEnhancedAudioPermission(requireContext())
+            if (isChecked && PrivilegedAccessManager.isPermissionGranted()) {
+                val appContext = requireContext().applicationContext
+                PrivilegedAccessManager.runAsync { PrivilegedAccessManager.grantEnhancedAudioPermission(appContext) }
             }
         }
 
@@ -590,7 +571,7 @@ class SettingsBottomSheet : BottomSheetDialogFragment() {
      * Filters and displays available FPS buttons dynamically based on Shizuku privileges and display refresh rate.
      */
     private fun setupDynamicFps() {
-        val isShizuku = ShizukuManager.isPermissionGranted()
+        val isShizuku = PrivilegedAccessManager.isPermissionGranted()
         val options = configManager.getAvailableFpsOptions(isShizuku)
 
         binding.btnFps120.visibility = if (options.contains(120)) View.VISIBLE else View.GONE
@@ -610,7 +591,7 @@ class SettingsBottomSheet : BottomSheetDialogFragment() {
      * Automatically selects recommended default FPS and Bitrate based on the selected resolution.
      */
     private fun applyQualityPreset(quality: String) {
-        val isShizuku = ShizukuManager.isPermissionGranted()
+        val isShizuku = PrivilegedAccessManager.isPermissionGranted()
         val options = configManager.getAvailableFpsOptions(isShizuku)
         val targetFpsButton = when (quality) {
             ConfigManager.QUALITY_MAX, ConfigManager.QUALITY_4K, ConfigManager.QUALITY_2K, ConfigManager.QUALITY_1080P -> {
@@ -799,11 +780,11 @@ class SettingsBottomSheet : BottomSheetDialogFragment() {
     }
 
     /*
-     * Clears view bindings and unregisters Shizuku observers when the view is destroyed to avoid leaks.
+     * Clears view bindings and unregisters privilege and recording observers.
      */
     override fun onDestroyView() {
-        ShizukuManager.removePermissionListener(shizukuPermissionListener)
-        ShizukuManager.removeBinderListener(shizukuBinderListener)
+        PrivilegedAccessManager.removePermissionListener(privilegedPermissionListener)
+        RecordingStateManager.removeListener(this)
         super.onDestroyView()
         _binding = null
     }

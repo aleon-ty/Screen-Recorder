@@ -51,6 +51,9 @@ class ConfigManager(private val context: Context) {
         const val KEY_SHIZUKU_DIRECT_RECORDING = "shizuku_direct_recording"
         const val KEY_SHIZUKU_HIDE_SYSTEM_BARS = "shizuku_hide_system_bars"
         const val KEY_SHIZUKU_ENHANCED_AUDIO = "shizuku_enhanced_audio"
+        const val KEY_PRIVILEGED_BACKEND = "privileged_backend"
+        const val BACKEND_SHIZUKU = "shizuku"
+        const val BACKEND_ROOT = "root"
 
         const val DEFAULT_MIC_ENABLED = true
         const val DEFAULT_SYSTEM_AUDIO_ENABLED = true
@@ -105,6 +108,12 @@ class ConfigManager(private val context: Context) {
     var isMicEnabled: Boolean
         get() = prefs.getBoolean(KEY_MIC_ENABLED, DEFAULT_MIC_ENABLED)
         set(value) = prefs.edit().putBoolean(KEY_MIC_ENABLED, value).apply()
+
+    var privilegedBackend: String
+        get() = prefs.getString(KEY_PRIVILEGED_BACKEND, BACKEND_SHIZUKU)
+            .let { if (it == BACKEND_ROOT) BACKEND_ROOT else BACKEND_SHIZUKU }
+        set(value) = prefs.edit().putString(KEY_PRIVILEGED_BACKEND,
+            if (value == BACKEND_ROOT) BACKEND_ROOT else BACKEND_SHIZUKU).apply()
 
     var isSystemAudioEnabled: Boolean
         get() = prefs.getBoolean(KEY_SYSTEM_AUDIO_ENABLED, DEFAULT_SYSTEM_AUDIO_ENABLED)
