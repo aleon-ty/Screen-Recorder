@@ -189,5 +189,3 @@ If you find ScreenRecorder useful, you can support its development.
 
 THIS BUILD NEVER OVERWRITE THE ORIGINAL APK THIS IS ONLY FOR EDUCATIONAL PURPOSE..
 
-
-```
