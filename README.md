@@ -33,6 +33,8 @@
   <p><b>Minimal • Fast • Material 3 Expressive Screen Recorder for Android</b></p>
 </div>
 
+## CURRENTLY IN PROGRESS TO IMPROVE THE POPUP AND FLOATING NAV BAR SETTINGS WITH SOME COOL SECRETS..
+
 ---
 
 ## 📸 Screenshots
